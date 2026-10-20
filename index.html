@@ -298,6 +298,17 @@ textarea{min-height:62px;resize:vertical}
 .kasten ul{margin:6px 0 0;padding-left:18px}
 .kasten li{margin:2px 0;overflow-wrap:anywhere}
 
+/* ---------- Spielplan-Import ---------- */
+details.rueckfall{margin:6px 0 4px}
+details.rueckfall summary{cursor:pointer;font-size:14px;font-weight:700;color:var(--muted);padding:6px 0}
+.imp-gruppe{margin:14px 0 4px;font-size:12px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+.imp-zeile{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid var(--linie);font-size:14px;cursor:pointer}
+.imp-zeile input{width:22px;height:22px;flex:none;margin:1px 0 0;padding:0;accent-color:var(--blau)}
+.imp-zeile.info{cursor:default;color:var(--muted)}
+.imp-diff{font-size:13px;color:var(--evtl-text);margin-top:2px}
+.imp-diff b{font-weight:800}
+.imp-fehler{color:var(--nein-text);background:var(--nein-bg);border-color:var(--nein-rand)}
+
 /* ---------- Toast ---------- */
 #toast{
   position:fixed;left:50%;transform:translateX(-50%);bottom:calc(104px + env(safe-area-inset-bottom));
@@ -410,6 +421,9 @@ body.multi #toast{bottom:calc(158px + env(safe-area-inset-bottom))}
       <input type="url" id="fApi" placeholder="https://script.google.com/macros/s/…/exec"></label>
     <p class="hinweis">Leer lassen = Standardadresse des Vereins. Mit Adresse sehen alle drei Trainer dieselben Daten.</p>
     <div class="knopfzeile">
+      <button type="button" id="btnImport">Spielplan vom BFV importieren</button>
+    </div>
+    <div class="knopfzeile">
       <button type="button" id="btnIcs">Kalender (.ics)</button>
       <button type="button" id="btnSicherung">Sicherung (.json)</button>
       <button type="button" id="btnReload">Neu laden</button>
@@ -418,6 +432,27 @@ body.multi #toast{bottom:calc(158px + env(safe-area-inset-bottom))}
   <div class="dlg-fuss">
     <button type="button" id="btnMenuZu">Schließen</button>
     <button type="button" class="primaer" id="btnMenuSpeichern">Speichern</button>
+  </div>
+</dialog>
+
+<dialog id="dlgImport">
+  <div class="dlg-kopf">Spielplan vom BFV importieren</div>
+  <div class="dlg-body">
+    <div id="impEingabe">
+      <label class="feld"><span>BFV-Link der Staffel</span>
+        <input type="url" id="impLink" placeholder="https://www.bfv.de/ergebnisse/wettbewerb/-/…"></label>
+      <p class="hinweis">Auf bfv.de die Staffel öffnen und die Adresse hier einfügen. Die App lädt den offiziellen PDF-Spielplan und zeigt erst eine Vorschau. Gelöscht wird nie etwas.</p>
+      <details class="rueckfall" id="impDetails">
+        <summary>Klappt nicht? Text aus dem PDF einfügen</summary>
+        <p class="hinweis">Auf bfv.de „Zum Liga-Spielplan“ öffnen, im PDF alles markieren, kopieren und hier einfügen.</p>
+        <textarea id="impText" rows="5" placeholder="AKTUELLE TERMINLISTE …"></textarea>
+      </details>
+    </div>
+    <div id="impVorschau"></div>
+  </div>
+  <div class="dlg-fuss">
+    <button type="button" id="impZurueck">Abbrechen</button>
+    <button type="button" class="primaer" id="impLos">Spielplan lesen</button>
   </div>
 </dialog>
 
@@ -1089,6 +1124,428 @@ $("#btnSicherung").onclick = ()=>{
   }, null, 2);
   datei("trainerplan-sicherung-" + heute.getFullYear() + "-" + p2(heute.getMonth()+1) + "-" + p2(heute.getDate()) + ".json", inhalt, "application/json");
 };
+
+/* =====================================================================
+   PDF-Leser
+   Liest den Text aus dem BFV-Spielplan-PDF (Apache FOP, PDF 1.4) ohne fremde
+   Bibliothek: Querverweistabelle, FlateDecode, ToUnicode-CMaps und
+   /Differences-Kodierung. Kein allgemeiner PDF-Leser.
+   ===================================================================== */
+const GLYPHEN = {space:" ",hyphen:"-",minus:"-",period:".",comma:",",colon:":",semicolon:";",parenleft:"(",parenright:")",
+  slash:"/",zero:"0",one:"1",two:"2",three:"3",four:"4",five:"5",six:"6",seven:"7",eight:"8",nine:"9",
+  adieresis:"ä",odieresis:"ö",udieresis:"ü",Adieresis:"Ä",Odieresis:"Ö",Udieresis:"Ü",germandbls:"ß",
+  endash:"–",emdash:"—",quoteright:"’",quoteleft:"‘",quotesingle:"'",quotedbl:'"',quotedblleft:"“",quotedblright:"”",
+  ampersand:"&",plus:"+",equal:"=",exclam:"!",question:"?",numbersign:"#",at:"@",underscore:"_",asterisk:"*",
+  bracketleft:"[",bracketright:"]",bar:"|",bullet:"•",periodcentered:"·",
+  eacute:"é",egrave:"è",agrave:"à",aacute:"á",ccedilla:"ç",oacute:"ó",iacute:"í",scaron:"š",ccaron:"č"};
+const WIN1252 = (()=>{ const t=[], dec=new TextDecoder("windows-1252"); for(let i=0;i<256;i++) t[i]=dec.decode(Uint8Array.of(i)); return t; })();
+function glyphZeichen(n){
+  if(n.length===1) return n;
+  if(GLYPHEN[n]) return GLYPHEN[n];
+  const u = /^uni([0-9A-F]{4})$/i.exec(n);
+  return u ? String.fromCharCode(parseInt(u[1],16)) : "";
+}
+function latin1(bytes){ let s=""; for(let i=0;i<bytes.length;i+=8192) s+=String.fromCharCode.apply(null, bytes.subarray(i,i+8192)); return s; }
+async function inflate(bytes){
+  const ds = new DecompressionStream("deflate");
+  return new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(ds)).arrayBuffer());
+}
+/* Teilstück in Klammern (<< >> oder [ ]) ab Position i, inklusive Klammern */
+function klammer(s, i, auf, zu){
+  let tiefe = 0, j = i;
+  while(j < s.length){
+    if(s.startsWith(auf, j)){ tiefe++; j += auf.length; continue; }
+    if(s.startsWith(zu, j)){ tiefe--; j += zu.length; if(!tiefe) return s.slice(i, j); continue; }
+    j++;
+  }
+  return s.slice(i);
+}
+/* Wert eines Schlüssels in einem Dictionary-Text: {ref:n}, "<<…>>", "[…]", Name oder Zahl */
+function dictWert(dict, key){
+  const m = new RegExp("/" + key + "(?![A-Za-z0-9])\\s*").exec(dict);
+  if(!m) return null;
+  const i = m.index + m[0].length, rest = dict.slice(i);
+  if(rest.startsWith("<<")) return klammer(dict, i, "<<", ">>");
+  if(rest[0]==="[") return klammer(dict, i, "[", "]");
+  const r = /^(\d+)\s+\d+\s+R/.exec(rest);
+  if(r) return {ref:+r[1]};
+  const w = /^\/?[^\s\/\[\]<>()]+/.exec(rest);
+  return w ? w[0] : null;
+}
+
+async function pdfText(buffer){
+  const bytes = new Uint8Array(buffer), s = latin1(bytes);
+  if(!s.startsWith("%PDF")) throw new Error("Das ist keine PDF-Datei.");
+
+  // Querverweistabelle lesen, sonst alle Objekte suchen
+  const lage = {};
+  let trailer = "";
+  const sx = s.lastIndexOf("startxref");
+  const xo = sx>=0 ? parseInt(s.slice(sx+9, sx+40).trim(), 10) : -1;
+  if(xo>0 && s.startsWith("xref", xo)){
+    const ti = s.indexOf("trailer", xo);
+    const tk = s.slice(xo+4, ti).trim().split(/\s+/);
+    for(let k=0; k<tk.length; ){
+      const start = +tk[k], anzahl = +tk[k+1]; k += 2;
+      for(let n=0; n<anzahl; n++, k+=3) if(tk[k+2]==="n") lage[start+n] = +tk[k];
+    }
+    trailer = s.slice(ti, sx);
+  }
+  if(!Object.keys(lage).length){
+    for(const m of s.matchAll(/(\d+)\s+\d+\s+obj\b/g)) lage[m[1]] = m.index;
+    trailer = s.slice(s.lastIndexOf("trailer"));
+  }
+
+  const cache = {};
+  function objekt(n){
+    if(cache[n]) return cache[n];
+    const pos = lage[n];
+    if(pos==null) throw new Error("PDF-Objekt " + n + " fehlt.");
+    const kopf = /^\s*\d+\s+\d+\s+obj/.exec(s.slice(pos, pos+40));
+    const start = pos + kopf[0].length;
+    const e = s.indexOf("endobj", start), p = s.indexOf("stream", start);
+    let o;
+    if(p>=0 && p<e){
+      const dict = s.slice(start, p);
+      let len = dictWert(dict, "Length");
+      if(len && len.ref) len = objekt(len.ref).dict;
+      let d0 = p + 6;
+      if(s[d0]==="\r") d0++;
+      if(s[d0]==="\n") d0++;
+      o = {dict, roh:bytes.subarray(d0, d0 + parseInt(len,10))};
+    }else{
+      o = {dict:s.slice(start, e).trim(), roh:null};
+    }
+    return cache[n] = o;
+  }
+  function aufloesen(v){ return v && v.ref ? objekt(v.ref).dict : v; }
+  async function streamDaten(n){
+    const o = objekt(n);
+    const f = dictWert(o.dict, "Filter");
+    if(!f) return o.roh;
+    if(f==="/FlateDecode") return inflate(o.roh);
+    throw new Error("PDF-Filter " + f + " wird nicht unterstützt.");
+  }
+
+  // Schriften: Zeichencode → Text
+  async function schrift(ref){
+    const dict = objekt(ref).dict, karte = {};
+    const zwei = /\/Subtype\s*\/Type0/.test(dict);
+    const enc = aufloesen(dictWert(dict, "Encoding"));
+    if(enc && typeof enc==="string" && enc.includes("/Differences")){
+      let code = 0;
+      for(const t of (dictWert(enc, "Differences")||"").replace(/^\[|\]$/g,"").trim().split(/\s+|(?=\/)/)){
+        if(/^\d+$/.test(t)) code = +t;
+        else if(t[0]==="/"){ karte[code] = glyphZeichen(t.slice(1)); code++; }
+      }
+    }
+    const tu = dictWert(dict, "ToUnicode");
+    if(tu && tu.ref){
+      const cmap = latin1(await streamDaten(tu.ref));
+      const uni = h => { h = h.padStart(4,"0"); let r=""; for(let i=0;i<h.length;i+=4) r+=String.fromCharCode(parseInt(h.substr(i,4),16)); return r; };
+      for(const b of cmap.matchAll(/beginbfchar([\s\S]*?)endbfchar/g))
+        for(const m of b[1].matchAll(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>/g)) karte[parseInt(m[1],16)] = uni(m[2]);
+      for(const b of cmap.matchAll(/beginbfrange([\s\S]*?)endbfrange/g))
+        for(const m of b[1].matchAll(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*(<[0-9a-fA-F]+>|\[[^\]]*\])/g)){
+          const a = parseInt(m[1],16), z = parseInt(m[2],16);
+          if(m[3][0]==="<"){
+            const basis = m[3].slice(1,-1).padStart(4,"0"), letzte = parseInt(basis.slice(-4),16);
+            const vorn = basis.length > 4 ? uni(basis.slice(0,-4)) : "";
+            for(let c=a; c<=z; c++) karte[c] = vorn + String.fromCharCode(letzte + c - a);
+          }else{
+            const liste = [...m[3].matchAll(/<([0-9a-fA-F]+)>/g)];
+            for(let c=a; c<=z && c-a<liste.length; c++) karte[c] = uni(liste[c-a][1]);
+          }
+        }
+    }
+    return {zwei, karte};
+  }
+  function dekodieren(f, roh){
+    if(!roh) return "";
+    let out = "";
+    if(f && f.zwei){
+      for(let i=0; i+1<roh.length; i+=2){ const c = (roh.charCodeAt(i)<<8) | roh.charCodeAt(i+1); out += f.karte[c] || ""; }
+    }else{
+      for(let i=0; i<roh.length; i++){ const c = roh.charCodeAt(i); out += (f && f.karte[c]!=null) ? f.karte[c] : WIN1252[c]; }
+    }
+    return out;
+  }
+
+  // Seiten in Reihenfolge
+  const seiten = [];
+  (function sammeln(dict){
+    if(/\/Type\s*\/Pages\b/.test(dict)){
+      for(const r of (dictWert(dict, "Kids")||"").matchAll(/(\d+)\s+\d+\s+R/g)) sammeln(objekt(+r[1]).dict);
+    }else seiten.push(dict);
+  })(aufloesen(dictWert(aufloesen(dictWert(trailer, "Root")), "Pages")));
+
+  const zeilen = [];
+  for(const seite of seiten){
+    const res = aufloesen(dictWert(seite, "Resources")) || "";
+    const fontDict = aufloesen(dictWert(res, "Font")) || "";
+    const fonts = {};
+    for(const m of fontDict.matchAll(/\/([^\s\/<>\[\]]+)\s+(\d+)\s+\d+\s+R/g)) fonts[m[1]] = await schrift(+m[2]);
+    const inhalt = dictWert(seite, "Contents");
+    const refs = inhalt && inhalt.ref ? [inhalt.ref] : [...String(inhalt||"").matchAll(/(\d+)\s+\d+\s+R/g)].map(m=>+m[1]);
+    let text = "";
+    for(const r of refs) text += latin1(await streamDaten(r)) + "\n";
+    zeilen.push(textAusInhalt(text, fonts, dekodieren));
+  }
+  return zeilen.join("\n");
+}
+
+/* Text-Operatoren eines Content-Streams auswerten; jede neue Textzeile (BT, Tm, T*, Td mit y) beginnt eine neue Zeile */
+function textAusInhalt(s, fonts, dekodieren){
+  const out = [];
+  let stapel = [], feld = null, font = null, i = 0;
+  const n = s.length, trenner = /[\s\/\[\]<>()%{}]/;
+  function befehl(op){
+    const letzte = stapel[stapel.length-1];
+    switch(op){
+      case "BT": case "Tm": case "T*": out.push("\n"); break;
+      case "Td": case "TD": if(letzte && letzte.v!==0) out.push("\n"); break;
+      case "Tf": { const nm = stapel[stapel.length-2]; font = nm ? fonts[nm.v] : null; break; }
+      case "Tj": if(letzte && letzte.t==="str") out.push(dekodieren(font, letzte.v)); break;
+      case "'": case '"': out.push("\n"); if(letzte && letzte.t==="str") out.push(dekodieren(font, letzte.v)); break;
+      case "TJ":
+        if(letzte && letzte.t==="arr") for(const e of letzte.v){
+          if(e.t==="str") out.push(dekodieren(font, e.v));
+          else if(e.t==="num" && e.v < -250) out.push(" ");
+        }
+        break;
+    }
+    stapel = [];
+  }
+  function ablegen(tk){ if(feld) feld.push(tk); else stapel.push(tk); }
+  while(i < n){
+    const c = s[i];
+    if(c===" "||c==="\n"||c==="\r"||c==="\t"||c==="\f"||c==="\0"){ i++; continue; }
+    if(c==="%"){ while(i<n && s[i]!=="\n" && s[i]!=="\r") i++; continue; }
+    if(c==="("){
+      let tiefe = 1, txt = ""; i++;
+      while(i<n && tiefe){
+        const ch = s[i++];
+        if(ch==="\\"){
+          const e = s[i++];
+          if(e>="0" && e<="7"){ let o = e; while(o.length<3 && s[i]>="0" && s[i]<="7") o += s[i++]; txt += String.fromCharCode(parseInt(o,8) & 255); }
+          else if(e==="n") txt += "\n"; else if(e==="r") txt += "\r"; else if(e==="t") txt += "\t";
+          else if(e==="b") txt += "\b"; else if(e==="f") txt += "\f";
+          else if(e==="\r"){ if(s[i]==="\n") i++; }
+          else if(e!=="\n") txt += e;
+        }else if(ch==="("){ tiefe++; txt += ch; }
+        else if(ch===")"){ tiefe--; if(tiefe) txt += ch; }
+        else txt += ch;
+      }
+      ablegen({t:"str", v:txt}); continue;
+    }
+    if(c==="<" && s[i+1]==="<"){ i += 2; stapel = []; continue; }
+    if(c===">" && s[i+1]===">"){ i += 2; stapel = []; continue; }
+    if(c==="<"){
+      const e = s.indexOf(">", i);
+      let h = s.slice(i+1, e).replace(/\s/g,""); if(h.length % 2) h += "0";
+      let txt = ""; for(let k=0; k<h.length; k+=2) txt += String.fromCharCode(parseInt(h.substr(k,2),16));
+      i = e + 1; ablegen({t:"str", v:txt}); continue;
+    }
+    if(c==="["){ feld = []; i++; continue; }
+    if(c==="]"){ const a = feld || []; feld = null; stapel.push({t:"arr", v:a}); i++; continue; }
+    if(c==="/"){ let j = i+1; while(j<n && !trenner.test(s[j])) j++; ablegen({t:"name", v:s.slice(i+1,j)}); i = j; continue; }
+    let j = i; while(j<n && !trenner.test(s[j])) j++;
+    if(j===i){ i++; continue; }
+    const w = s.slice(i, j); i = j;
+    if(/^[+-]?(\d+\.?\d*|\.\d+)$/.test(w)) ablegen({t:"num", v:+w});
+    else if(!feld) befehl(w);
+  }
+  return out.join("");
+}
+
+/* =====================================================================
+   Spielplan-Import (BFV-Terminliste)
+   ===================================================================== */
+const LIGEN = {"313473":"E1", "313945":"E2"};   // Liganummer → Team (Herbst 26/27); neue Staffeln wählt man in der Vorschau
+const EIGENES_TEAM = /k(ö|oe|o)tz/i;
+const HEIM_ORT = "Waldsportanlage";
+
+function vereinsname(x){
+  let v = String(x||"").trim();
+  // „(FC Günzburg)“ = nicht angetreten/zurückgezogen: äußere Klammer weg, „(SG) Kötz I.“ bleibt
+  if(v.startsWith("(") && v.endsWith(")")){
+    const innen = v.slice(1,-1); let tiefe = 0, ok = true;
+    for(const ch of innen){ if(ch==="(") tiefe++; else if(ch===")"){ tiefe--; if(tiefe<0){ ok=false; break; } } }
+    if(ok && !tiefe) v = innen.trim();
+  }
+  return v;
+}
+
+function spielplanLesen(text){
+  const s = String(text||"").replace(/ /g," ").replace(/[–—]/g,"-").replace(/\s+/g," ");
+  const liga = (/LIGANUMMER\s*(\d{6})/i.exec(s) || [])[1] || "";
+  const titel = ((/TERMINLISTE\s+(.+?)\s+MEISTERSCHAFTEN/i.exec(s) || [])[1] || "").trim();
+  const tage = [...s.matchAll(/(\d+)\s*\.\s*SPIELTAG/gi)].map(m=>({pos:m.index, nr:m[1]}));
+  const ende = String.raw`(?=\s+(?:\d+\s*:\s*\d+|n\.\s?an\.|abges\S*|abgesagt|annull\S*|ausgef\S*|nicht\s+angetr\S*|\d{3}\s+\d{2}\.\d{2}\.\d{4}|\d+\s*\.\s*SPIELTAG|Kursiv|ERGEBNISSE\s+ONLINE|Seite\s+\d+\s+von|AKTUELLE\s+TERMINLISTE|SP\.-NR\.)|\s*$)`;
+  const re = new RegExp(String.raw`(?:^|\s)(\d{3})\s+(\d{2})\.(\d{2})\.(\d{4})\s+(?:(\d{1,2}):(\d{2})\s+)?(.+?)\s+-\s+(.+?)` + ende, "gi");
+  const spiele = [];
+  for(const m of s.matchAll(re)){
+    const tag = tage.filter(t=>t.pos < m.index).pop();
+    spiele.push({nr:m[1], datum:m[4]+"-"+m[3]+"-"+m[2], zeit:m[5] ? p2(m[5])+":"+m[6] : "",
+      heim:vereinsname(m[7]), gast:vereinsname(m[8]), sptg:tag ? tag.nr : ""});
+  }
+  return {liga, titel, spiele};
+}
+
+function gegnerNorm(g){ return String(g||"").toLowerCase().replace(/[^a-z0-9äöüß]/g,""); }
+
+/* Vergleicht den BFV-Plan mit den Terminen der App. Ergebnis: neu, geändert, gleich, fehlt (nur Info). */
+function importAbgleich(plan, team){
+  const liste = [], benutzt = new Set();
+  for(const sp of plan.spiele){
+    const heim = EIGENES_TEAM.test(sp.heim), gast = EIGENES_TEAM.test(sp.gast);
+    if(heim===gast) continue;                       // Spiel ohne uns
+    const gegner = heim ? sp.gast : sp.heim;
+    if(/^spielfrei$/i.test(gegner)) continue;
+    const kennung = plan.liga + sp.nr, ha = heim ? "H" : "A";
+    let alt = S.termine.find(t=>t.id===kennung) || S.termine.find(t=>t.kennung===kennung);
+    if(!alt){
+      // von Hand angelegtes Liga-Spiel ohne Kennung: nur bei eindeutigem Treffer übernehmen
+      const k = S.termine.filter(t=>!benutzt.has(t.id) && t.typ==="Liga" && t.team===team && !t.kennung && t.ha===ha && gegnerNorm(t.gegner)===gegnerNorm(gegner));
+      if(k.length===1) alt = k[0];
+    }
+    if(alt) benutzt.add(alt.id);
+    const zeit = sp.zeit || (alt && alt.datum===sp.datum && zeitBekannt(alt) ? alt.zeit : "00:00");
+    const neu = {
+      id: alt ? alt.id : kennung, typ: alt ? alt.typ : "Liga", team: alt ? alt.team : team,
+      datum: sp.datum, zeit, gegner, ha,
+      ort: alt ? (alt.ort||"") : (heim ? HEIM_ORT : ""),
+      kennung, sptg: sp.sptg || (alt ? alt.sptg||"" : ""), notiz: alt ? (alt.notiz||"") : ""
+    };
+    const diff = [];
+    if(alt){
+      if(alt.datum!==neu.datum) diff.push(["Datum", dm(alt), dm(neu)]);
+      if(zeitText(alt)!==zeitText(neu)) diff.push(["Zeit", zeitText(alt), zeitText(neu)]);
+      if(alt.ha!==neu.ha) diff.push(["Heim/Auswärts", alt.ha==="A"?"auswärts":"heim", ha==="A"?"auswärts":"heim"]);
+      if(alt.gegner!==neu.gegner) diff.push(["Gegner", alt.gegner, neu.gegner]);
+      if((alt.kennung||"")!==kennung) diff.push(["Kennung", alt.kennung||"–", kennung]);
+      if(String(alt.sptg||"")!==String(neu.sptg)) diff.push(["Spieltag", alt.sptg||"–", neu.sptg]);
+    }
+    liste.push({art: !alt ? "neu" : diff.length ? "geaendert" : "gleich", termin:neu, diff, an:true});
+  }
+  // Termine dieser Liga, die im BFV-Plan nicht mehr vorkommen (werden nicht gelöscht)
+  const fehlt = plan.liga ? S.termine.filter(t=>!benutzt.has(t.id) && String(t.kennung||t.id).startsWith(plan.liga)) : [];
+  return {liste, fehlt};
+}
+
+let imp = null;   // {plan, team, abgleich}
+
+function importOeffnen(){
+  imp = null;
+  $("#impText").value = "";
+  $("#impDetails").open = false;
+  $("#impEingabe").style.display = "";
+  $("#impVorschau").innerHTML = "";
+  $("#impLos").textContent = "Spielplan lesen";
+  $("#impLos").disabled = false;
+  $("#impZurueck").textContent = "Abbrechen";
+  if($("#dlgMenu").open) $("#dlgMenu").close();
+  $("#dlgImport").showModal();
+}
+
+function staffelAusLink(link){ const m = /([0-9A-Z]{20,}-[A-Z])\b/i.exec(link||""); return m ? m[1] : ""; }
+
+async function bfvPdfLaden(staffel){
+  const ctrl = new AbortController(), timer = setTimeout(()=>ctrl.abort(), 25000);
+  try{
+    const r = await fetch("https://service-prod.bfv.de/rest/pdfexport/Spielplan?staffel=" + encodeURIComponent(staffel), {signal:ctrl.signal});
+    if(!r.ok) throw new Error("BFV antwortet mit Fehler " + r.status + ".");
+    return await r.arrayBuffer();
+  }finally{ clearTimeout(timer); }
+}
+
+async function importLesen(){
+  const link = $("#impLink").value.trim(), text = $("#impText").value.trim();
+  const box = $("#impVorschau");
+  let quelle;
+  try{
+    $("#impLos").disabled = true;
+    if(text){
+      quelle = text;
+    }else{
+      const staffel = staffelAusLink(link);
+      if(!staffel) throw new Error("Im Link steht keine BFV-Staffel. Bitte die Adresse der Staffel von bfv.de einfügen.");
+      box.innerHTML = `<div class="kasten">Lade Spielplan vom BFV …</div>`;
+      quelle = await pdfText(await bfvPdfLaden(staffel));
+    }
+    const plan = spielplanLesen(quelle);
+    if(!plan.spiele.length) throw new Error("Im Spielplan wurden keine Spiele gefunden.");
+    if(!plan.liga) throw new Error("Die Liganummer fehlt im Text. Bitte die ganze Seite aus dem PDF kopieren.");
+    const team = LIGEN[plan.liga] || (S.team!=="alle" ? S.team : "E1");
+    imp = {plan, team};
+    importVorschau();
+  }catch(e){
+    const msg = e && e.name==="AbortError" ? "Der BFV hat nicht rechtzeitig geantwortet." : (e && e.message) || String(e);
+    box.innerHTML = `<div class="kasten imp-fehler"><b>Das hat nicht geklappt.</b> ${esc(msg)}
+      ${text ? "" : "<br>Ausweg: den Text aus dem PDF oben einfügen."}</div>`;
+    if(!text) $("#impDetails").open = true;
+    $("#impLos").disabled = false;
+  }
+}
+
+function importVorschau(){
+  const {plan} = imp;
+  imp.abgleich = importAbgleich(plan, imp.team);
+  const {liste, fehlt} = imp.abgleich;
+  const zeile = (x, i) => {
+    const t = x.termin;
+    const kopf = `${WD[d(t).getDay()]} ${dm(t)} · ${esc(zeitText(t))} · ${esc(titel(t))}`;
+    const diff = x.diff.map(([feld, a, b])=>`${esc(feld)}: ${esc(a)} → <b>${esc(b)}</b>`).join(" · ");
+    return `<label class="imp-zeile"><input type="checkbox" data-imp="${i}"${x.an?" checked":""}>
+      <div>${kopf}${istVorbei(t)?" <small>(vorbei)</small>":""}${diff?`<div class="imp-diff">${diff}</div>`:""}</div></label>`;
+  };
+  const gruppe = (art, ueberschrift) => {
+    const teil = liste.map((x,i)=>[x,i]).filter(([x])=>x.art===art);
+    return teil.length ? `<div class="imp-gruppe">${ueberschrift} (${teil.length})</div>` + teil.map(([x,i])=>zeile(x,i)).join("") : "";
+  };
+  const gleich = liste.filter(x=>x.art==="gleich");
+  const auswahl = liste.filter(x=>x.art!=="gleich" && x.an).length;
+  $("#impEingabe").style.display = "none";
+  $("#impVorschau").innerHTML = `
+    <div class="kasten">${esc(plan.titel || "BFV-Spielplan")} · Liganummer ${esc(plan.liga)}<br>${liste.length} Spiele der SG Kötz gefunden.</div>
+    <label class="feld"><span>Gilt für Team</span>
+      <select id="impTeam"><option${imp.team==="E1"?" selected":""}>E1</option><option${imp.team==="E2"?" selected":""}>E2</option></select></label>
+    ${gruppe("geaendert","Geändert")}
+    ${gruppe("neu","Neu")}
+    ${gleich.length ? `<div class="imp-gruppe">Unverändert (${gleich.length})</div><div class="hinweis">${gleich.map(x=>esc(dm(x.termin)+" "+x.termin.gegner)).join(" · ")}</div>` : ""}
+    ${fehlt.length ? `<div class="imp-gruppe">Nicht mehr im BFV-Plan (${fehlt.length})</div>
+       <div class="hinweis">Bleiben in der App, bitte selbst prüfen: ${fehlt.map(t=>esc(dm(t)+" "+t.gegner)).join(" · ")}</div>` : ""}
+    ${!auswahl && !liste.some(x=>x.art!=="gleich") ? `<div class="kasten">Alles ist schon auf dem Stand des BFV.</div>` : ""}`;
+  $("#impLos").textContent = auswahl ? auswahl + (auswahl===1 ? " Termin übernehmen" : " Termine übernehmen") : "Nichts zu übernehmen";
+  $("#impLos").disabled = !auswahl;
+  $("#impZurueck").textContent = "Zurück";
+}
+
+function importUebernehmen(){
+  const gewaehlt = imp.abgleich.liste.filter(x=>x.art!=="gleich" && x.an);
+  for(const x of gewaehlt){
+    const t = x.termin, i = S.termine.findIndex(y=>y.id===t.id);
+    if(i>=0) S.termine[i] = t; else S.termine.push(t);
+    vormerken({art:"termin", termin:t});
+  }
+  $("#dlgImport").close();
+  render();
+  toast(gewaehlt.length + (gewaehlt.length===1 ? " Termin" : " Termine") + " übernommen" + (S.api ? " – werden gespeichert" : ""));
+}
+
+$("#btnImport").onclick = importOeffnen;
+$("#impLos").onclick = ()=>{ if(imp && imp.abgleich) importUebernehmen(); else importLesen(); };
+$("#impZurueck").onclick = ()=>{ if(imp){ importOeffnen(); } else $("#dlgImport").close(); };
+$("#dlgImport").addEventListener("change", e=>{
+  if(e.target.id==="impTeam"){ imp.team = e.target.value; importVorschau(); return; }
+  const cb = e.target.closest("[data-imp]");
+  if(cb){
+    imp.abgleich.liste[+cb.dataset.imp].an = cb.checked;
+    const n = imp.abgleich.liste.filter(x=>x.art!=="gleich" && x.an).length;
+    $("#impLos").textContent = n ? n + (n===1 ? " Termin übernehmen" : " Termine übernehmen") : "Nichts ausgewählt";
+    $("#impLos").disabled = !n;
+  }
+});
 
 /* ---------- Start ---------- */
 lokalLaden();          // sofort den Gerätestand zeigen, Google Sheets lädt im Hintergrund nach
