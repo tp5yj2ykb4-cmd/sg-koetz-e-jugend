@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src https://script.google.com https://script.googleusercontent.com https://service-prod.bfv.de; base-uri 'none'; form-action 'none'">
 <meta name="theme-color" content="#22361A">
 <meta name="color-scheme" content="light dark">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -756,7 +757,8 @@ function anzeigeAktualisieren(){
 
 /* ---------- Auswertung ---------- */
 function teamPasst(t){ return S.team==="alle" || t.team===S.team || t.team==="E1+E2"; }
-function st(tid,trid){ return (S.status[tid]||{})[trid] || ""; }
+/* Nur bekannte Werte: die Tabelle ist offen beschreibbar, Unbekanntes gilt als offen. */
+function st(tid,trid){ const s = (S.status[tid]||{})[trid]; return s==="ja" || s==="nein" || s==="vielleicht" ? s : ""; }
 function anzahlJa(tid){ return S.trainer.filter(t=>st(tid,t.id)==="ja").length; }
 function meinOffen(t){ return !istVorbei(t) && !st(t.id,S.ich); }
 
@@ -792,7 +794,7 @@ function chipsHtml(t, dunkel){
   const warnen = !dunkel && !istVorbei(t) && t.typ!=="Training" && anzahlJa(t.id)===0;
   return S.trainer.map(tr=>{
     const s = st(t.id,tr.id);
-    return `<button type="button" class="chip${tr.id===S.ich?" ich":""}" data-s="${s}" data-t="${esc(t.id)}" data-tr="${esc(tr.id)}"
+    return `<button type="button" class="chip${tr.id===S.ich?" ich":""}" data-s="${esc(s)}" data-t="${esc(t.id)}" data-tr="${esc(tr.id)}"
       aria-label="${esc(tr.name)}: ${STATUS_TEXT[s]} – antippen zum Ändern"
       ><span class="dot" aria-hidden="true">${STATUS_ZEICHEN[s]}</span>${esc(tr.name)}</button>`;
   }).join("") + (warnen ? `<span class="warn">niemand zugesagt</span>` : "");
@@ -818,7 +820,7 @@ function render(){
         <button type="button" class="teilen" data-teilen="${esc(n.id)}">Teilen</button>
       </div>
       <div class="match">${esc(titel(n))}</div>
-      <div class="when">${WD[d(n).getDay()]}, ${dm(n)} · ${esc(zeitText(n))}${zeitBekannt(n)?" Uhr":""} · ${esc(n.team)} · ${esc(n.ort||"Ort offen")}</div>
+      <div class="when">${WD[d(n).getDay()]}, ${esc(dm(n))} ·${esc(zeitText(n))}${zeitBekannt(n)?" Uhr":""} · ${esc(n.team)} · ${esc(n.ort||"Ort offen")}</div>
       <div class="chips">${chipsHtml(n,true)}</div>
     </div>` : "");
 
@@ -1494,7 +1496,7 @@ function importVorschau(){
   const {liste, fehlt} = imp.abgleich;
   const zeile = (x, i) => {
     const t = x.termin;
-    const kopf = `${WD[d(t).getDay()]} ${dm(t)} · ${esc(zeitText(t))} · ${esc(titel(t))}`;
+    const kopf = `${WD[d(t).getDay()]||""} ${esc(dm(t))} ·${esc(zeitText(t))} · ${esc(titel(t))}`;
     const diff = x.diff.map(([feld, a, b])=>`${esc(feld)}: ${esc(a)} → <b>${esc(b)}</b>`).join(" · ");
     return `<label class="imp-zeile"><input type="checkbox" data-imp="${i}"${x.an?" checked":""}>
       <div>${kopf}${istVorbei(t)?" <small>(vorbei)</small>":""}${diff?`<div class="imp-diff">${diff}</div>`:""}</div></label>`;
